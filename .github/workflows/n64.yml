@@ -277,7 +277,7 @@ jobs:
           cp -a "src/N64/mupen64plus-video-gliden64/ini/." "src/N64/tmp/${{matrix.emupath}}/"
 
           # mac exclusive clones
-          if ${{runner.os == 'macOS'}}; then
+          # if ${{runner.os == 'macOS'}}; then
             # cp "/usr/local/opt/zlib/lib/libz.1.2.13.dylib" "src/N64/tmp/${{matrix.emupath}}/libz.dylib"
             # cp "/usr/local/opt/libpng/lib/libpng16.16.dylib" "src/N64/tmp/${{matrix.emupath}}/libpng16.dylib"
             # cp "/usr/local/opt/sdl2/lib/libSDL2-2.0.0.dylib" "src/N64/tmp/${{matrix.emupath}}/libSDL2.dylib"
@@ -288,7 +288,7 @@ jobs:
             # install_name_tool -change "/usr/local/opt/libpng/lib/libpng16.16.dylib" "$BINPATH/libpng16.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
             # install_name_tool -change "/usr/local/opt/sdl2/lib/libSDL2-2.0.0.dylib" "$BINPATH/libSDL2.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
             # install_name_tool -change "/usr/local/opt/freetype/lib/libfreetype.6.dylib" "$BINPATH/libfreetype.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
-          fi
+          # fi
       
       - name: Auditing new file collection
         run: |
