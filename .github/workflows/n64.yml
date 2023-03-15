@@ -1,0 +1,521 @@
+name: N64 Builder
+
+on:
+  schedule:
+    - cron: "0 12 1 * *"
+  workflow_dispatch:
+  push:
+
+jobs:
+  update-modules:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'schedule' && github.repository == 'thelostmods/crossemu-emulators') || (github.event_name != 'schedule')
+
+    outputs:
+      output1: ${{ steps.update.outputs.need_rebuild }}
+
+    steps:
+      - name: Initialize repository
+        uses: actions/checkout@v3
+        with:
+          ref: "main"
+          persist-credentials: true
+          fetch-depth: 0
+      
+      - id: update
+        name: Check for updates
+        run: |
+          # Rebase repository for clean changes pull
+          git reset --hard
+          git pull --rebase
+          
+          # Makes sure any pre-installed sub-modules are updated passively
+          git submodule update --init --recursive --checkout --quiet
+          
+          # Ensure we have the directory for the sub-modules
+          echo "Checking for N64 repository..."
+          if [ -d "src/N64" ]; then
+            echo "Found repository. Beginning operations..."
+          else
+            echo "Directory not found, populating with modules..."
+            mkdir -p "src/N64"
+          fi; cd "src/N64"
+
+          # Declare the repositories in case we need to pull them
+          repos=(
+            "https://github.com/thelostmods/mupen64plus-core"
+            "https://github.com/mupen64plus/mupen64plus-audio-sdl"
+            "https://github.com/mupen64plus/mupen64plus-input-sdl"
+            "https://github.com/mupen64plus/mupen64plus-win32-deps"
+
+            "https://github.com/mupen64plus/mupen64plus-rsp-cxd4"
+            "https://github.com/mupen64plus/mupen64plus-rsp-hle"
+            "https://github.com/mupen64plus/mupen64plus-rsp-z64"
+
+            "https://github.com/mupen64plus/mupen64plus-video-arachnoid"
+            "https://github.com/mupen64plus/mupen64plus-video-glide64mk2"
+            "https://github.com/mupen64plus/mupen64plus-video-rice"
+            "https://github.com/mupen64plus/mupen64plus-video-z64"
+
+            "https://github.com/gonetz/GLideN64"
+            "https://github.com/ata4/angrylion-rdp-plus"
+          )
+
+          # Declare the module suffix's that will be in folder names
+          modules=(
+            "core" "audio-sdl" "input-sdl" "win32-deps"
+            "rsp-cxd4-sse2" "rsp-hle" "rsp-z64"
+            "video-arachnoid" "video-glide64mk2" "video-rice" "video-z64"
+            "video-gliden64" "video-angrylion-plus"
+          )
+
+          # A check for added modules because they arent detect in diff
+          ADDED_MODULES=false
+          
+          # Loop all the repos and add or update sub-modules
+          for ((i=0;i<${#modules[@]};i++)); do
+            module=${modules[$i]}
+
+            echo "Checking mupen64plus-$module"
+            if [ -d "mupen64plus-$module" ]; then
+              # Module found, perform an update
+              cd "mupen64plus-$module"
+              git pull origin master
+              cd ".."
+            else
+              # Module not found, so add it
+              git submodule add "${repos[$i]}" "mupen64plus-$module"
+              ADDED_MODULE=true
+            fi
+          done
+
+          echo "Entering repository root"
+          cd ".."
+          
+          # Check for any updates or additions to modules
+          echo "Comparing differences - Was there an update?"
+          LOGS="$(git diff --ignore-submodules=dirty)"
+
+          if [ "$LOGS" == "" ] && [ ! $ADDED_MODULE ]; then
+            # We were up-to-date
+            echo "All files were already up to date!"
+            echo "::set-output name=need_rebuild::0"
+          else
+            # There were updates
+            echo "Updates occured! Triggering rebuild soon."
+              
+            # Print the change results
+            echo "Listing changelog..."
+            echo "$LOGS"
+            echo "::set-output name=need_rebuild::1"
+          fi
+          
+      - name: Commit & push packages
+        uses: actions-js/push@master
+        with:
+          github_token: ${{secrets.GITHUB_TOKEN}}
+          message: "Added or updated N64 sub-modules."
+
+  build-unix:
+    needs: update-modules
+    if: (needs.update-modules.outputs.output1 == 1 || github.event_name == 'workflow_dispatch')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [
+          { os: ubuntu-latest, ext: "so",    bin: linux.tar.gz, emupath: app/consoles/n64/emulator },
+          { os: macos-latest,  ext: "dylib", bin: macos.zip,    emupath: app/consoles/n64/emulator }
+        ]
+
+    runs-on: ${{matrix.os}}
+
+    steps:
+      - name: Initialize repository
+        uses: actions/checkout@v3
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Setup installation dependencies
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            sudo apt-get -qq update
+            sudo apt-get -y install build-essential cmake libglew-dev libsdl2-dev
+            sudo apt-get -y install freeglut3-dev nasm libspeexdsp-dev libsamplerate-dev libboost-all-dev
+
+          else
+            brew update
+            brew install cmake glew sdl2 sdl2_net freeglut nasm speexdsp libsamplerate boost zlib
+
+            SOURCE=/Library/Developer/CommandLineTools/SDKs
+            TARGET=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs
+
+            for FILE in $(ls $SOURCE); do
+              echo $FILE
+              if [ ! -f "$TARGET/$FILE" ]; then
+                ln -s "$SOURCE/$FILE" "$TARGET/$FILE"
+              fi
+            done
+          fi
+
+      - name: Initializing submodules and creating temporary workspace
+        run: |
+          git submodule update --init --recursive --checkout --quiet
+
+          echo "Confirm we have a bin directory..."
+          if [ ! -d "bin/N64" ]; then
+            mkdir -p "bin/N64"
+          fi
+
+          echo "Making temporary repository to create packages in..."
+          mkdir -p "src/N64/tmp/${{matrix.emupath}}"
+
+          # Define a reuseable function
+          echo "
+            LIB=\"\$1\"
+            BIN=\"\$2.${{matrix.ext}}\"
+            cd \"src/N64/\$LIB/projects/unix\"
+
+            if ${{runner.os=='macos'}}; then
+              sed -i '' 's/10.6/10.7/g' Makefile
+            fi
+
+            make all
+            cp \"\$BIN\" \"../../../tmp/${{matrix.emupath}}/\$BIN\"
+          " >> src/N64/tmp/build_plugin.sh
+
+      - name: Building mupen64plus-core
+        run: |
+          sh src/N64/tmp/build_plugin.sh "mupen64plus-core" "mupen64plus"
+          
+      - name: Building mupen64plus-audio-sdl
+        run: |
+          LIB="mupen64plus-audio-sdl"
+          sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          
+      - name: Building mupen64plus-input-sdl
+        run: |
+          LIB="mupen64plus-input-sdl"
+          sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          
+      - name: Building mupen64plus-rsp-cxd4-sse2
+        run: |
+          LIB="mupen64plus-rsp-cxd4-sse2"
+          sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          
+      - name: Building mupen64plus-rsp-hle
+        run: |
+          LIB="mupen64plus-rsp-hle"
+          sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          
+      - name: Building mupen64plus-rsp-z64
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            LIB="mupen64plus-rsp-z64"
+            sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          fi
+          
+      - name: Building mupen64plus-video-arachnoid
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            LIB="mupen64plus-video-arachnoid"
+            sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          fi
+          
+      - name: Building mupen64plus-video-glide64mk2
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            LIB="mupen64plus-video-glide64mk2"
+            sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          fi
+          
+      - name: Building mupen64plus-video-rice
+        run: |
+          LIB="mupen64plus-video-rice"
+          sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          
+      - name: Building mupen64plus-video-z64
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            LIB="mupen64plus-video-z64"
+            sh src/N64/tmp/build_plugin.sh "$LIB" "$LIB"
+          fi
+          
+      - name: Building mupen64plus-video-gliden64
+        run: |
+          if ${{runner.os == 'linux'}}; then
+            LIB="mupen64plus-video-gliden64"
+            BIN="$LIB.${{matrix.ext}}"
+            cd "src/N64/$LIB/projects/cmake"
+            cmake -G "Unix Makefiles" -DMUPENPLUSAPI=On "../../src/"
+            make
+            cp "plugin/Release/mupen64plus-video-GLideN64.${{matrix.ext}}" "../../../tmp/${{matrix.emupath}}/$BIN"
+          fi
+          
+      - name: Building mupen64plus-video-angrylion-plus
+        run: |
+          LIB="mupen64plus-video-angrylion-plus"
+          BIN="$LIB.${{matrix.ext}}"
+          mkdir "src/N64/$LIB/build"
+          cd "src/N64/$LIB/build"
+          cmake -G "Unix Makefiles" ".."
+          make
+          cp "$BIN" "../../tmp/${{matrix.emupath}}/$BIN"
+
+      - name: Auditing files
+        run: |
+          ls "src/N64/tmp/${{matrix.emupath}}"
+
+      - name: Cloning data folder contents
+        run: |
+          cp -a "src/N64/mupen64plus-core/data/." "src/N64/tmp/${{matrix.emupath}}/"
+          cp -a "src/N64/mupen64plus-input-sdl/data/." "src/N64/tmp/${{matrix.emupath}}/"
+          cp -a "src/N64/mupen64plus-video-rice/data/." "src/N64/tmp/${{matrix.emupath}}/"
+          cp -a "src/N64/mupen64plus-video-glide64mk2/data/." "src/N64/tmp/${{matrix.emupath}}/"
+          cp -a "src/N64/mupen64plus-video-gliden64/ini/." "src/N64/tmp/${{matrix.emupath}}/"
+
+          # mac exclusive clones
+          if ${{runner.os == 'macOS'}}; then
+            # cp "/usr/local/opt/zlib/lib/libz.1.2.13.dylib" "src/N64/tmp/${{matrix.emupath}}/libz.dylib"
+            # cp "/usr/local/opt/libpng/lib/libpng16.16.dylib" "src/N64/tmp/${{matrix.emupath}}/libpng16.dylib"
+            # cp "/usr/local/opt/sdl2/lib/libSDL2-2.0.0.dylib" "src/N64/tmp/${{matrix.emupath}}/libSDL2.dylib"
+            # cp "/usr/local/opt/freetype/lib/libfreetype.6.dylib" "src/N64/tmp/${{matrix.emupath}}/libfreetype.dylib"
+
+            # BINPATH="~/Library/Application\ Support/Godot/app_userdata/consoles/n64/emulator"
+            # install_name_tool -change "/usr/lib/libz.1.dylib" "$BINPATH/libz.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
+            # install_name_tool -change "/usr/local/opt/libpng/lib/libpng16.16.dylib" "$BINPATH/libpng16.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
+            # install_name_tool -change "/usr/local/opt/sdl2/lib/libSDL2-2.0.0.dylib" "$BINPATH/libSDL2.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
+            # install_name_tool -change "/usr/local/opt/freetype/lib/libfreetype.6.dylib" "$BINPATH/libfreetype.dylib" "src/N64/tmp/${{matrix.emupath}}/mupen64plus.dylib"
+          fi
+      
+      - name: Auditing new file collection
+        run: |
+          ls "src/N64/tmp/${{matrix.emupath}}"
+    
+      - name: Generate package
+        run: |
+          cd "src/N64/tmp/app"
+          if ${{runner.os == 'linux'}}; then
+            tar -czf "../../../../bin/N64/${{matrix.bin}}" "consoles"
+          else
+            zip -r "../../../../bin/N64/${{matrix.bin}}" "consoles"
+          fi
+
+      - name: Caching package
+        uses: actions/upload-artifact@v3
+        with:
+          name: N64_${{matrix.bin}}
+          path: bin/N64/${{matrix.bin}}
+
+  build-windows:
+    needs: update-modules
+    if: (needs.update-modules.outputs.output1 == 1 || github.event_name == 'workflow_dispatch')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [
+          { toolset: v141_xp, platform: x86, vs: 2019, bin: win32.zip, arch: Win32, emupath: app\consoles\n64\emulator },
+          { toolset: v143 ,   platform: x64, vs: 2022, bin: win64.zip, arch: x64,   emupath: app\consoles\n64\emulator }
+        ]
+
+    runs-on: windows-${{ matrix.vs }}
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - uses: microsoft/setup-msbuild@v1
+
+      - name: Initialize repository
+        uses: actions/checkout@v3
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Setup installation dependencies
+        run: |
+          for /f "tokens=1" %%R in ('git rev-parse --short HEAD') do echo G_REV=%%R>> "%GITHUB_ENV%"
+          echo.
+          msbuild --version
+          echo.
+
+      - name: Initializing submodules and creating temporary workspace
+        run: |
+          git submodule update --init --recursive --checkout --quiet
+
+          echo "Confirm we have a bin directory..."
+          if not exist "bin\N64" md "bin\N64"
+
+          echo "Making temporary repository to create packages in..."
+          md "src\N64\tmp\${{matrix.emupath}}"
+
+      - name: Building mupen64plus-core
+        run: |
+          cd src\N64\mupen64plus-core
+          msbuild projects\msvc\mupen64plus-core.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-audio-sdl
+        run: |
+          cd src\N64\mupen64plus-audio-sdl
+          msbuild projects\msvc\mupen64plus-audio-sdl.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-audio-sdl.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-input-sdl
+        run: |
+          cd src\N64\mupen64plus-input-sdl
+          msbuild projects\msvc\mupen64plus-input-sdl.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-input-sdl.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-rsp-cxd4-sse2
+        run: |
+          cd src\N64\mupen64plus-rsp-cxd4-sse2
+          msbuild projects\msvc\mupen64plus-rsp-cxd4.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-rsp-cxd4.dll" ..\tmp\${{matrix.emupath}}\mupen64plus-rsp-cxd4-sse2.dll
+
+      - name: Building mupen64plus-rsp-hle
+        run: |
+          cd src\N64\mupen64plus-rsp-hle
+          msbuild projects\msvc\mupen64plus-rsp-hle.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-rsp-hle.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-video-glide64mk2
+        run: |
+          cd src\N64\mupen64plus-video-glide64mk2
+          msbuild projects\msvc\mupen64plus-video-glide64mk2.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-video-glide64mk2.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-video-rice
+        run: |
+          cd src\N64\mupen64plus-video-rice
+          msbuild projects\msvc\mupen64plus-video-rice.vcxproj /p:Configuration=Release;Platform=${{matrix.arch}};PlatformToolset=${{matrix.toolset}}
+          copy "projects\msvc\${{matrix.arch}}\Release\mupen64plus-video-rice.dll" ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-video-gliden64
+        run: |
+          cd src\N64\mupen64plus-video-gliden64
+          msbuild projects\msvc\GLideN64.sln /m /p:Configuration=Release_mupenplus;Platform=${{matrix.arch}}
+          copy projects\msvc\bin\${{matrix.arch}}\Release_mupenplus\mupen64plus-video-GLideN64.dll ..\tmp\${{matrix.emupath}}\
+
+      - name: Building mupen64plus-video-angrylion-plus
+        run: |
+          cd src\N64\mupen64plus-video-angrylion-plus
+          md build
+          cd build
+          cmake -DBUILD_PROJECT64=ON -T "${{matrix.toolset}}" -A "${{matrix.arch}}" ..
+          cmake --build . --config Release
+          copy Release\*.dll ..\..\tmp\${{matrix.emupath}}\
+
+      - name: Auditing files
+        run: |
+          dir "src\N64\tmp\${{matrix.emupath}}"
+
+      - name: Cloning data folder contents
+        run: |
+          xcopy "src\N64\mupen64plus-core\data" "src\N64\tmp\${{matrix.emupath}}"
+          xcopy "src\N64\mupen64plus-input-sdl\data" "src\N64\tmp\${{matrix.emupath}}"
+          xcopy "src\N64\mupen64plus-video-rice\data" "src\N64\tmp\${{matrix.emupath}}"
+          xcopy "src\N64\mupen64plus-video-glide64mk2\data" "src\N64\tmp\${{matrix.emupath}}"
+          xcopy "src\N64\mupen64plus-video-gliden64\ini" "src\N64\tmp\${{matrix.emupath}}"
+
+          copy "src\N64\mupen64plus-win32-deps\freetype-2.13.0\lib\${{ matrix.platform }}\*.dll" "src\N64\tmp\${{matrix.emupath}}"
+          copy "src\N64\mupen64plus-win32-deps\libpng-1.6.39\lib\${{ matrix.platform }}\*.dll" "src\N64\tmp\${{matrix.emupath}}"
+          copy "src\N64\mupen64plus-win32-deps\SDL2-2.26.3\lib\${{ matrix.platform }}\*.dll" "src\N64\tmp\${{matrix.emupath}}"
+          copy "src\N64\mupen64plus-win32-deps\SDL2_net-2.2.0\lib\${{ matrix.platform }}\*.dll" "src\N64\tmp\${{matrix.emupath}}"
+          copy "src\N64\mupen64plus-win32-deps\zlib-1.2.13\lib\${{ matrix.platform }}\*.dll" "src\N64\tmp\${{matrix.emupath}}"
+      
+      - name: Auditing new file collection
+        run: |
+          dir "src\N64\tmp\app\consoles\n64\emulator"
+    
+      - name: Generate package
+        uses: thedoctor0/zip-release@0.7.1
+        with:
+          type: 'zip'
+          filename: '${{matrix.bin}}'
+          directory: 'bin/N64'
+          path: '../../src/N64/tmp/app/consoles/'
+
+      - name: Caching package
+        uses: actions/upload-artifact@v3
+        with:
+          name: N64_${{matrix.bin}}
+          path: bin/N64/${{matrix.bin}}
+
+  upload-binaries:
+    runs-on: ubuntu-latest
+    needs: [build-unix, build-windows]
+
+    steps:
+      - name: Initialize repository
+        uses: actions/checkout@v3
+        with:
+          ref: "main"
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Pulling linux package
+        uses: actions/download-artifact@v3
+        with:
+          name: N64_linux.tar.gz
+          path: bin/N64
+      
+      - name: Remove linux package cache
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: N64_linux.tar.gz
+          failOnError: false
+
+      - name: Pulling macos package
+        uses: actions/download-artifact@v3
+        with:
+          name: N64_macos.zip
+          path: bin/N64
+
+      - name: Remove macos package cache
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: N64_macos.zip
+          failOnError: false
+
+      - name: Pulling win32 package
+        uses: actions/download-artifact@v3
+        with:
+          name: N64_win32.zip
+          path: bin/N64
+
+      - name: Remove win32 package cache
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: N64_win32.zip
+          failOnError: false
+
+      - name: Pulling win64 package
+        uses: actions/download-artifact@v3
+        with:
+          name: N64_win64.zip
+          path: bin/N64
+
+      - name: Remove win64 package cache
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: N64_win64.zip
+          failOnError: false
+
+      - name: Stage changes
+        run: |
+          git add bin/N64/linux.tar.gz
+          git add bin/N64/macos.zip
+          git add bin/N64/win32.zip
+          git add bin/N64/win64.zip
+
+      - name: Commit & push package
+        uses: actions-js/push@master
+        with:
+          github_token: ${{secrets.GITHUB_TOKEN}}
+          message: "Updated N64 packages."
